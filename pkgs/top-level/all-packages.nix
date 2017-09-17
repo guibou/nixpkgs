@@ -15739,6 +15739,8 @@ with pkgs;
 
   polybar = callPackage ../applications/misc/polybar { };
 
+  ptex = callPackage ../development/libraries/ptex {};
+
   rssguard = libsForQt5.callPackage ../applications/networking/feedreaders/rssguard { };
 
   scudcloud = callPackage ../applications/networking/instant-messengers/scudcloud { };
