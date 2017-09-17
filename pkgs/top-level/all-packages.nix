@@ -15889,6 +15889,8 @@ with pkgs;
 
   opencpn = callPackage ../applications/misc/opencpn { };
 
+  openfx = callPackage ../development/libraries/openfx {};
+
   openimageio = callPackage ../applications/graphics/openimageio { };
 
   openjump = callPackage ../applications/misc/openjump { };
