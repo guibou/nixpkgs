@@ -10057,6 +10057,8 @@ with pkgs;
 
   openslp = callPackage ../development/libraries/openslp {};
 
+  openvdb = callPackage ../development/libraries/openvdb {};
+
   inherit (callPackages ../development/libraries/libressl { })
     libressl_2_5
     libressl_2_6;
