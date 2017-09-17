@@ -10031,6 +10031,8 @@ with pkgs;
 
   openexr = callPackage ../development/libraries/openexr { };
 
+  openexrid = callPackage ../development/libraries/openexrid { };
+
   openldap = callPackage ../development/libraries/openldap { };
 
   opencolorio = callPackage ../development/libraries/opencolorio { };
