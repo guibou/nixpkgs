@@ -4855,6 +4855,8 @@ in {
   else
     callPackage ../development/python-modules/numpy { };
 
+  fbtftp = callPackage ../development/python-modules/fbtftp { };
+
   numpy-stl = callPackage ../development/python-modules/numpy-stl { };
 
   nunavut = callPackage ../development/python-modules/nunavut { };
