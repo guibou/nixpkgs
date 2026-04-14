@@ -1,0 +1,84 @@
+commit b44c90dd3f0e9090f00c2d50f19b9b8d330feedb
+Author: Luite Stegeman <stegeman@gmail.com>
+Date:   Fri Mar 6 11:09:17 2026 +0100
+
+    Fixes for black holes
+    
+     - suspend duplicate work for eager black holes
+     - detect eager black holes in checkBlockingQueues
+     - don't overwrite existing black holes even if they're not
+         in an eager blackhole frame
+     - don't deadlock on self when thunk is already blackholed
+    
+    Fixes #26936
+
+diff --git a/rts/ThreadPaused.c b/rts/ThreadPaused.c
+index cbb56f9023..484bb67e09 100644
+--- a/rts/ThreadPaused.c
++++ b/rts/ThreadPaused.c
+@@ -183,6 +183,23 @@ stackSqueeze(Capability *cap, StgTSO *tso, StgPtr bottom)
+     }
+ }
+ 
++// Check whether tso is the owner of the blackhole bh.
++// This check is only valid if called on the capability that tso runs on
++static bool
++threadPausedBlackHoleOwner(StgTSO *tso, StgClosure *bh)
++{
++    StgClosure *ind = RELAXED_LOAD(&((StgInd*)bh)->indirectee);
++    const StgInfoTable *ind_info = GET_INFO(UNTAG_CLOSURE(ind));
++    if (ind == (StgClosure*)tso) {
++        return true;
++    }
++    if (ind_info == &stg_BLOCKING_QUEUE_CLEAN_info
++        || ind_info == &stg_BLOCKING_QUEUE_DIRTY_info) {
++        return ((StgBlockingQueue*)UNTAG_CLOSURE(ind))->owner == tso;
++    }
++    return false;
++}
++
+ /* -----------------------------------------------------------------------------
+  * Pausing a thread
+  *
+@@ -287,8 +304,10 @@ threadPaused(Capability *cap, StgTSO *tso)
+             // Note that great care is required when entering computations
+             // suspended by this mechanism. See Note [AP_STACKs must be eagerly
+             // blackholed] for details.
+-            if (((bh_info == &stg_BLACKHOLE_info)
+-                 && (RELAXED_LOAD(&((StgInd*)bh)->indirectee) != (StgClosure*)tso))
++            if (((bh_info == &stg_BLACKHOLE_info
++                  || bh_info == &__stg_EAGER_BLACKHOLE_info
++                  || bh_info == &stg_CAF_BLACKHOLE_info)
++                && !threadPausedBlackHoleOwner(tso, bh))
+                 || (bh_info == &stg_WHITEHOLE_info))
+             {
+                 debugTrace(DEBUG_squeeze,
+@@ -318,8 +337,11 @@ threadPaused(Capability *cap, StgTSO *tso)
+             // If we have a frame that is already eagerly blackholed, we
+             // shouldn't overwrite its payload: There may already be a blocking
+             // queue (see #26324).
+-            if(frame_info == &stg_bh_upd_frame_info) {
+-                // eager black hole: we do nothing
++            if(frame_info == &stg_bh_upd_frame_info
++               || bh_info == &stg_BLACKHOLE_info
++               || bh_info == &__stg_EAGER_BLACKHOLE_info
++               || bh_info == &stg_CAF_BLACKHOLE_info) {
++                // already a black hole: we do nothing
+ 
+                 // it should be a black hole (but we may not own it, as another
+                 // thread could have raced us to claim it)
+diff --git a/rts/Threads.c b/rts/Threads.c
+index 371c13aa19..706d7f63a9 100644
+--- a/rts/Threads.c
++++ b/rts/Threads.c
+@@ -442,7 +442,9 @@ checkBlockingQueues (Capability *cap, StgTSO *tso)
+         // thing the result would be the same in almost all cases. See #20093.
+         p = UNTAG_CLOSURE(bq->bh);
+         const StgInfoTable *pinfo = ACQUIRE_LOAD(&p->header.info);
+-        if (pinfo != &stg_BLACKHOLE_info ||
++        if ((pinfo != &stg_BLACKHOLE_info &&
++             pinfo != &__stg_EAGER_BLACKHOLE_info &&
++             pinfo != &stg_CAF_BLACKHOLE_info) ||
+             (RELAXED_LOAD(&((StgInd *)p)->indirectee) != (StgClosure*)bq))
+         {
+             wakeBlockingQueue(cap,bq);
