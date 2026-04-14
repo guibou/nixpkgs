@@ -338,7 +338,15 @@
             })
           ]
 
-      ++ (import ./common-llvm-patches.nix { inherit lib version fetchpatch; });
+      ++ (import ./common-llvm-patches.nix { inherit lib version fetchpatch; })
+      # patch GHC 9.14 for crash,
+      # See
+      # https://gitlab.haskell.org/ghc/ghc/-/merge_requests/15640#note_669580
+      # for the upstream MR including the patchs
+      ++ lib.optionals (version == "9.14.1") [
+          ./ghc_blackhole1.patch
+          ./ghc_blackhole2.patch
+      ];
 
     stdenv = stdenvNoCC;
   },
