@@ -346,6 +346,10 @@
       ++ lib.optionals (version == "9.14.1") [
           ./ghc_blackhole1.patch
           ./ghc_blackhole2.patch
+
+          # Patch GHC 9.14 for correct :load behavior
+          # See https://gitlab.haskell.org/ghc/ghc/-/merge_requests/15980
+          ./fix_for_load.diff
       ];
 
     stdenv = stdenvNoCC;

@@ -1,0 +1,421 @@
+diff --git a/compiler/GHC/Unit/Finder.hs b/compiler/GHC/Unit/Finder.hs
+index cb91559cfe..4759ba81b2 100644
+--- a/compiler/GHC/Unit/Finder.hs
++++ b/compiler/GHC/Unit/Finder.hs
+@@ -42,6 +42,7 @@
+ import GHC.Unit.Env
+ import GHC.Unit.Types
+ import GHC.Unit.Module
++import GHC.Unit.Module.Graph (ModuleNameHomeMap (..), mgHomeModuleMap)
+ import GHC.Unit.Home
+ import GHC.Unit.Home.Graph (UnitEnvGraph)
+ import qualified GHC.Unit.Home.Graph as HUG
+@@ -69,6 +70,7 @@
+ import GHC.Driver.Config.Finder
+ import qualified Data.Set as Set
+ import Data.List.NonEmpty ( NonEmpty (..) )
++import qualified System.Directory as SD
+ import qualified System.OsPath as OsPath
+ import qualified Data.List.NonEmpty as NE
+ 
+@@ -156,7 +158,8 @@
+       dflags    = hsc_dflags hsc_env
+       fopts     = initFinderOpts dflags
+   in do
+-    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) mhome_unit mod pkg_qual
++    let home_module_map = mgHomeModuleMap (hsc_mod_graph hsc_env)
++    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) home_module_map mhome_unit mod pkg_qual
+ 
+ findImportedModuleWithIsBoot :: HscEnv -> ModuleName -> IsBootInterface -> PkgQual -> IO FindResult
+ findImportedModuleWithIsBoot hsc_env mod is_boot pkg_qual = do
+@@ -169,22 +172,27 @@
+   :: FinderCache
+   -> FinderOpts
+   -> UnitEnv
++  -> ModuleNameHomeMap
+   -> Maybe HomeUnit
+   -> ModuleName
+   -> PkgQual
+   -> IO FindResult
+-findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
++findImportedModuleNoHsc fc fopts ue home_module_map mhome_unit mod_name mb_pkg =
+   case mb_pkg of
+     NoPkgQual  -> unqual_import
+     ThisPkg uid | (homeUnitId <$> mhome_unit) == Just uid -> home_import
+-                | Just os <- lookup uid other_fopts -> home_pkg_import (uid, os)
++                | Just os <- M.lookup uid other_fopts_map -> home_pkg_import (uid, os)
+                 | otherwise -> pprPanic "findImportModule" (ppr mod_name $$ ppr mb_pkg $$ ppr (homeUnitId <$> mhome_unit) $$ ppr uid $$ ppr (map fst all_opts))
+     OtherPkg _ -> pkg_import
+   where
++    ModuleNameHomeMap complete_units module_name_map = home_module_map
++    module_home_units = M.findWithDefault Set.empty mod_name module_name_map
++    current_unit_id = homeUnitId <$> mhome_unit
+     all_opts = case mhome_unit of
+-                Nothing -> other_fopts
+-                Just home_unit -> (homeUnitId home_unit, fopts) : other_fopts
++                Nothing -> other_fopts_list
++                Just home_unit -> (homeUnitId home_unit, fopts) : other_fopts_list
+ 
++    other_fopts_map = M.fromList other_fopts_list
+ 
+     home_import = case mhome_unit of
+                    Just home_unit -> findHomeModule fc fopts home_unit mod_name
+@@ -195,7 +203,7 @@
+       -- If the module is reexported, then look for it as if it was from the perspective
+       -- of that package which reexports it.
+       | Just real_mod_name <- mod_name `M.lookup` finder_reexportedModules opts =
+-        findImportedModuleNoHsc fc opts ue (Just $ DefiniteHomeUnit uid Nothing) real_mod_name NoPkgQual
++        findImportedModuleNoHsc fc opts ue home_module_map (Just $ DefiniteHomeUnit uid Nothing) real_mod_name NoPkgQual
+       | mod_name `Set.member` finder_hiddenModules opts =
+         return (mkHomeHidden uid)
+       | otherwise =
+@@ -204,7 +212,7 @@
+     -- Do not be smart and change this to `foldr orIfNotFound home_import hs` as
+     -- that is not the same!! home_import is first because we need to look within ourselves
+     -- first before looking at the packages in order.
+-    any_home_import = foldr1 orIfNotFound (home_import:| map home_pkg_import other_fopts)
++    any_home_import = foldr1 orIfNotFound (home_import :| map home_pkg_import other_fopts_list)
+ 
+     pkg_import    = findExposedPackageModule fc fopts units  mod_name mb_pkg
+ 
+@@ -215,9 +223,21 @@
+     units     = case mhome_unit of
+                   Nothing -> ue_homeUnitState ue
+                   Just home_unit -> HUG.homeUnitEnv_units $ ue_findHomeUnitEnv (homeUnitId home_unit) ue
+-    hpt_deps :: [UnitId]
+-    hpt_deps  = homeUnitDepends units
+-    other_fopts  = map (\uid -> (uid, initFinderOpts (homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)))) hpt_deps
++    hpt_deps :: Set.Set UnitId
++    hpt_deps = Set.fromList (homeUnitDepends units)
++    dep_providers = Set.intersection module_home_units hpt_deps
++    known_other_uids =
++      let providers = maybe dep_providers (\u -> Set.delete u dep_providers) current_unit_id
++      in Set.toList providers
++    unknown_units =
++      let candidates = Set.difference hpt_deps complete_units
++          excluded = maybe dep_providers (\u -> Set.insert u dep_providers) current_unit_id
++      in Set.toList (Set.difference candidates excluded)
++    other_home_uids = known_other_uids ++ unknown_units
++    other_fopts_list =
++      [ (uid, initFinderOpts (homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)))
++      | uid <- other_home_uids
++      ]
+ 
+ -- | Locate a plugin module requested by the user, for a compiler
+ -- plugin.  This consults the same set of exposed packages as
+diff --git a/compiler/GHC/Unit/Module/Graph.hs b/compiler/GHC/Unit/Module/Graph.hs
+index e56ee33ca7..c6e9ffa69b 100644
+--- a/compiler/GHC/Unit/Module/Graph.hs
++++ b/compiler/GHC/Unit/Module/Graph.hs
+@@ -69,6 +69,8 @@
+    , mgLookupModule
+    , mgLookupModuleName
+    , mgHasHoles
++   , ModuleNameHomeMap (ModuleNameHomeMap)
++   , mgHomeModuleMap
+    , showModMsg
+ 
+     -- ** Reachability queries
+@@ -158,10 +160,11 @@
+ import GHC.Utils.Misc ( partitionWith )
+ 
+ import System.FilePath
++import Data.Set (Set)
++import qualified Data.Set as Set
++import Data.Map (Map)
+ import qualified Data.Map as Map
+ import GHC.Types.Unique.DSet
+-import qualified Data.Set as Set
+-import Data.Set (Set)
+ import GHC.Unit.Module
+ import GHC.Unit.Module.ModNodeKey
+ import GHC.Unit.Module.Stage
+@@ -206,14 +209,47 @@
+   -- Cached computation, whether any of the ModuleGraphNode are isHoleModule,
+   -- This is only used for a hack in GHC.Iface.Load to do with backpack, please
+   -- remove this at the earliest opportunity.
++  , mg_home_map :: ModuleNameHomeMap
++    -- ^ For each module name, which home unit UnitIds define it together with the set of units for which the listing is complete.
+   }
+ 
++data ModuleNameHomeMap = ModuleNameHomeMap !(Set UnitId)
++                                           !(Map ModuleName (Set UnitId))
++
++mkHomeModuleMap :: [ModuleGraphNode] -> ModuleNameHomeMap
++mkHomeModuleMap nodes = ModuleNameHomeMap completeUnits providerMap where
++
++    providerMap :: Map ModuleName (Set UnitId)
++    providerMap
++        = Map.fromListWith Set.union $
++          [
++              (ms_mod_name modSummary, Set.singleton (ms_unitid modSummary)) |
++                  ModuleNode _ (ModuleNodeCompile modSummary) <- nodes
++          ]
++
++    completeUnits :: Set UnitId
++    completeUnits
++        = Set.fromList $
++          [
++              ms_unitid modSummary |
++                  ModuleNode _ (ModuleNodeCompile modSummary) <- nodes
++          ]
++
++    {-NOTE:
++        The matching with `ModuleNodeCompile` results in nodes with
++        `ModuleNodeFixed` in their info being dropped.
++    -}
++
++mgHomeModuleMap :: ModuleGraph -> ModuleNameHomeMap
++mgHomeModuleMap = mg_home_map
++
+ -- | Why do we ever need to construct empty graphs? Is it because of one shot mode?
+ emptyMG :: ModuleGraph
+ emptyMG = ModuleGraph [] (graphReachability emptyGraph, const Nothing)
+                          (graphReachability emptyGraph, const Nothing)
+                          (graphReachability emptyGraph, const Nothing)
+                          False
++                         (ModuleNameHomeMap Set.empty Map.empty)
+ 
+ -- | Construct a module graph. This function should be the only entry point for
+ -- building a 'ModuleGraph', since it is supposed to be built once and never modified.
+@@ -312,7 +348,7 @@
+   where
+     duplicate_errs = rights (Map.elems node_types)
+ 
+-    node_types :: Map.Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
++    node_types :: Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
+     node_types = Map.fromListWithKey go [ (mkNodeKey n, Left (moduleNodeType n)) | n <- mg_mss ]
+       where
+         -- Multiple nodes with the same key are not allowed.
+@@ -323,7 +359,7 @@
+ 
+ -- | Check that all dependencies in the graph are present in the node_types map.
+ -- This is a helper function used by checkModuleGraph.
+-checkAllDependenciesInGraph :: Map.Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
++checkAllDependenciesInGraph :: Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
+                             -> ModuleGraphNode
+                             -> Maybe ModuleGraphInvariantError
+ checkAllDependenciesInGraph node_types node =
+@@ -338,7 +374,7 @@
+ -- | Check if for the fixed module node invariant:
+ --
+ --   Fixed nodes can only depend on other fixed nodes.
+-checkFixedModuleInvariant :: Map.Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
++checkFixedModuleInvariant :: Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
+                 -> ModuleGraphNode
+                 -> Maybe ModuleGraphInvariantError
+ checkFixedModuleInvariant node_types node = case node of
+@@ -488,13 +524,17 @@
+ -- To preserve invariants, 'f' can't change the isBoot status.
+ mapMG :: (ModSummary -> ModSummary) -> ModuleGraph -> ModuleGraph
+ mapMG f mg@ModuleGraph{..} = mg
+-  { mg_mss = flip fmap mg_mss $ \case
+-      InstantiationNode uid iuid -> InstantiationNode uid iuid
+-      LinkNode uid nks -> LinkNode uid nks
+-      ModuleNode deps (ModuleNodeFixed key loc)  -> ModuleNode deps (ModuleNodeFixed key loc)
+-      ModuleNode deps (ModuleNodeCompile ms) -> ModuleNode deps (ModuleNodeCompile (f ms))
+-      UnitNode deps uid -> UnitNode deps uid
++  { mg_mss = new_mss
++  , mg_home_map = mkHomeModuleMap new_mss
+   }
++  where
++    new_mss =
++      flip fmap mg_mss $ \case
++        InstantiationNode uid iuid -> InstantiationNode uid iuid
++        LinkNode uid nks -> LinkNode uid nks
++        ModuleNode deps (ModuleNodeFixed key loc)  -> ModuleNode deps (ModuleNodeFixed key loc)
++        ModuleNode deps (ModuleNodeCompile ms) -> ModuleNode deps (ModuleNodeCompile (f ms))
++        UnitNode deps uid -> UnitNode deps uid
+ 
+ -- | Map a function 'f' over all the 'ModSummaries', in 'IO'.
+ -- To preserve invariants, 'f' can't change the isBoot status.
+@@ -847,7 +887,7 @@
+ -- described in the export list haddocks.
+ --------------------------------------------------------------------------------
+ 
+-newtype NodeMap a = NodeMap { unNodeMap :: Map.Map NodeKey a }
++newtype NodeMap a = NodeMap { unNodeMap :: Map NodeKey a }
+   deriving (Functor, Traversable, Foldable)
+ 
+ -- | Transitive dependencies, including SOURCE edges
+@@ -923,7 +963,7 @@
+     lookup_key :: ZeroScopeKey -> Maybe Int
+     lookup_key = fmap zeroSummaryNodeKey . lookup_node
+ 
+-    node_map :: Map.Map ZeroScopeKey ZeroSummaryNode
++    node_map :: Map ZeroScopeKey ZeroSummaryNode
+     node_map =
+       Map.fromList [ (s, node)
+                    | node <- nodes
+@@ -1022,7 +1062,7 @@
+     lookup_key ::  (NodeKey, ModuleStage) -> Maybe Int
+     lookup_key = fmap stageSummaryNodeKey . lookup_node
+ 
+-    node_map :: Map.Map (NodeKey, ModuleStage) StageSummaryNode
++    node_map :: Map (NodeKey, ModuleStage) StageSummaryNode
+     node_map =
+       Map.fromList [ (s, node)
+                    | node <- nodes
+@@ -1040,10 +1080,13 @@
+ extendMG :: ModuleGraph -> ModuleGraphNode -> ModuleGraph
+ extendMG ModuleGraph{..} node =
+   ModuleGraph
+-    { mg_mss = node : mg_mss
+-    , mg_graph =  mkTransDeps (node : mg_mss)
+-    , mg_loop_graph = mkTransLoopDeps (node : mg_mss)
+-    , mg_zero_graph = mkTransZeroDeps (node : mg_mss)
++    { mg_mss = new_mss
++    , mg_graph =  mkTransDeps new_mss
++    , mg_loop_graph = mkTransLoopDeps new_mss
++    , mg_zero_graph = mkTransZeroDeps new_mss
+     , mg_has_holes = mg_has_holes || maybe False isHsigFile (moduleNodeInfoHscSource =<< mgNodeIsModule node)
++    , mg_home_map = mkHomeModuleMap new_mss
+     }
++  where
++    new_mss = node : mg_mss
+ 
+diff --git a/ghc/GHCi/UI.hs b/ghc/GHCi/UI.hs
+index 0243b5767d..eb0e208172 100644
+--- a/ghc/GHCi/UI.hs
++++ b/ghc/GHCi/UI.hs
+@@ -478,9 +478,9 @@
+ default_args :: [String]
+ default_args = []
+ 
+-interactiveUI :: GhciSettings -> [(FilePath, Maybe UnitId, Maybe Phase)] -> Maybe [String]
++interactiveUI :: GhciSettings -> DynFlags -> [(FilePath, Maybe UnitId, Maybe Phase)] -> Maybe [String]
+               -> Ghc ()
+-interactiveUI config srcs maybe_exprs = do
++interactiveUI config initDynFlags srcs maybe_exprs = do
+    -- HACK! If we happen to get into an infinite loop (eg the user
+    -- types 'let x=x in x' at the prompt), then the thread will block
+    -- on a blackhole, and become unreachable during GC.  The GC will
+@@ -496,7 +496,7 @@
+     -- Initialise buffering for the *interpreted* I/O system
+    (nobuffering, flush) <- runInternal initInterpBuffering
+ 
+-   installInteractiveHomeUnits
++   installInteractiveHomeUnits initDynFlags
+ 
+    -- Update the LogAction. Ensure we don't override the user's log action lest
+    -- we break -ddump-json (#14078)
+@@ -689,8 +689,8 @@
+ -- Within GHCi, you can rely on this property.
+ --
+ -- For motivation and design, see Note [Multiple Home Units aware GHCi]
+-installInteractiveHomeUnits :: GHC.GhcMonad m => m ()
+-installInteractiveHomeUnits = do
++installInteractiveHomeUnits :: GHC.GhcMonad m => DynFlags -> m ()
++installInteractiveHomeUnits dflags = do
+   logger <- getLogger
+   hsc_env <- GHC.getSession
+   -- The initial set of DynFlags used for interactive evaluation is the same
+@@ -698,7 +698,7 @@
+   -- * -XExtendedDefaultRules and
+   -- * -XNoMonomorphismRestriction.
+   -- See Note [Changing language extensions for interactive evaluation] #10857
+-  dflags <- getDynFlags
++
+   let
+     dflags0' =
+       (xopt_set_unlessExplSpec LangExt.ExtendedDefaultRules xopt_set) .
+@@ -728,30 +728,31 @@
+   dflagsPrompt <- GHC.normaliseInteractiveDynFlags logger $
+     setHomeUnitId interactiveGhciUnitId $ dflags0
+       { packageFlags =
+-        [ sessionUnitExposedFlag ] ++
+-        [ homeUnitPkgFlag uid
+-        | homeUnitEnv <- Foldable.toList $ hsc_HUG hsc_env
+-        , Just homeUnit <- [homeUnitEnv_home_unit homeUnitEnv]
+-        , let uid = homeUnitId homeUnit
+-        ] ++
+-        (packageFlags dflags0)
++        concat
++          [ [ sessionUnitExposedFlag ]
++          , [ homeUnitPkgFlag uid
++            | homeUnitEnv <- Foldable.toList $ hsc_HUG hsc_env
++            , Just homeUnit <- [homeUnitEnv_home_unit homeUnitEnv]
++            , let uid = homeUnitId homeUnit
++            ]
++          , packageFlags dflags0
++          ]
+       , importPaths = []
+       }
+ 
+   let
+     -- Explicitly depends on all current home units.
+-    -- Additionally, we remove all 'importPaths', to avoid accidentally adding
+-    -- any 'Target's to this 'Unit' that are not ':load'ed.
+     dflagsSession =
+       setHomeUnitId interactiveSessionUnitId $ dflags
+         { packageFlags =
+-          [ homeUnitPkgFlag uid
+-          | homeUnitEnv <- Foldable.toList $ hsc_HUG hsc_env
+-          , Just homeUnit <- [homeUnitEnv_home_unit homeUnitEnv]
+-          , let uid = homeUnitId homeUnit
+-          ] ++
+-          (packageFlags dflags)
+-        , importPaths = []
++          concat
++            [ [ homeUnitPkgFlag uid
++              | homeUnitEnv <- Foldable.toList $ hsc_HUG hsc_env
++              , Just homeUnit <- [homeUnitEnv_home_unit homeUnitEnv]
++              , let uid = homeUnitId homeUnit
++              ]
++            , packageFlags dflags
++            ]
+         }
+ 
+   let
+diff --git a/ghc/Main.hs b/ghc/Main.hs
+index 259678550f..3558741350 100644
+--- a/ghc/Main.hs
++++ b/ghc/Main.hs
+@@ -294,6 +294,7 @@
+   throwGhcException (CmdLineError "not built for interactive use")
+ #else
+ ghciUI units srcs maybe_expr = do
++  initFlags <- getDynFlags
+   hs_srcs <- case NE.nonEmpty units of
+     Just ne_units -> do
+       initMulti ne_units (checkOptions DoMake)
+@@ -304,7 +305,7 @@
+           s <- initMake srcs
+           dflags <- getDynFlags
+           return $ map (uncurry (,Just $ homeUnitId_ dflags,)) s
+-  interactiveUI defaultGhciSettings hs_srcs maybe_expr
++  interactiveUI defaultGhciSettings initFlags hs_srcs maybe_expr
+ #endif
+ 
+ -- ----------------------------------------------------------------------------
+diff --git a/testsuite/tests/ghci/prog023/src/A.hs b/testsuite/tests/ghci/prog023/src/A.hs
+new file mode 100644
+index 0000000000..0cc60c8fb5
+--- /dev/null
++++ b/testsuite/tests/ghci/prog023/src/A.hs
+@@ -0,0 +1,4 @@
++module A where
++
++foo :: String
++foo = "Called foo"
+diff --git a/testsuite/tests/ghci/prog024/src/A.hs b/testsuite/tests/ghci/prog024/src/A.hs
+new file mode 100644
+index 0000000000..0cc60c8fb5
+--- /dev/null
++++ b/testsuite/tests/ghci/prog024/src/A.hs
+@@ -0,0 +1,4 @@
++module A where
++
++foo :: String
++foo = "Called foo"
+diff --git a/testsuite/tests/ghci/prog024/src/B.hs b/testsuite/tests/ghci/prog024/src/B.hs
+new file mode 100644
+index 0000000000..0fb55899fd
+--- /dev/null
++++ b/testsuite/tests/ghci/prog024/src/B.hs
+@@ -0,0 +1,5 @@
++module B where
++
++import A
++
++bar = "Called bar"

@@ -1,0 +1,389 @@
+commit ba7c336f957e08a2540dbd092e2750d243b786c0
+Author: fendor <fendor@posteo.de>
+Date:   Tue Apr 28 15:18:41 2026 +0200
+
+    Dont clean the importDirs from interactive-session
+
+diff --git a/ghc/GHCi/UI.hs b/ghc/GHCi/UI.hs
+index aabe3840bb..d719a4c6b5 100644
+--- a/ghc/GHCi/UI.hs
++++ b/ghc/GHCi/UI.hs
+@@ -484,9 +484,9 @@ default_prompt_cont = generatePromptFunctionFromString "ghci| "
+ default_args :: [String]
+ default_args = []
+ 
+-interactiveUI :: GhciSettings -> [(FilePath, Maybe UnitId, Maybe Phase)] -> Maybe [String]
++interactiveUI :: GhciSettings -> DynFlags -> [(FilePath, Maybe UnitId, Maybe Phase)] -> Maybe [String]
+               -> Ghc ()
+-interactiveUI config srcs maybe_exprs = do
++interactiveUI config initDynFlags srcs maybe_exprs = do
+    -- HACK! If we happen to get into an infinite loop (eg the user
+    -- types 'let x=x in x' at the prompt), then the thread will block
+    -- on a blackhole, and become unreachable during GC.  The GC will
+@@ -502,7 +502,7 @@ interactiveUI config srcs maybe_exprs = do
+     -- Initialise buffering for the *interpreted* I/O system
+    (nobuffering, flush) <- runInternal initInterpBuffering
+ 
+-   installInteractiveHomeUnits
++   installInteractiveHomeUnits initDynFlags
+ 
+    -- Update the LogAction. Ensure we don't override the user's log action lest
+    -- we break -ddump-json (#14078)
+@@ -695,8 +695,8 @@ commands in the GHCi session.
+ -- Within GHCi, you can rely on this property.
+ --
+ -- For motivation and design, see Note [Multiple Home Units aware GHCi]
+-installInteractiveHomeUnits :: GHC.GhcMonad m => m ()
+-installInteractiveHomeUnits = do
++installInteractiveHomeUnits :: GHC.GhcMonad m => DynFlags -> m ()
++installInteractiveHomeUnits dflags = do
+   logger <- getLogger
+   hsc_env <- GHC.getSession
+   -- The initial set of DynFlags used for interactive evaluation is the same
+@@ -704,7 +704,7 @@ installInteractiveHomeUnits = do
+   -- * -XExtendedDefaultRules and
+   -- * -XNoMonomorphismRestriction.
+   -- See Note [Changing language extensions for interactive evaluation] #10857
+-  dflags <- getDynFlags
++
+   let
+     dflags0' =
+       (xopt_set_unlessExplSpec LangExt.ExtendedDefaultRules xopt_set) .
+@@ -734,30 +734,31 @@ installInteractiveHomeUnits = do
+   dflagsPrompt <- GHC.normaliseInteractiveDynFlags logger $
+     setHomeUnitId interactiveGhciUnitId $ dflags0
+       { packageFlags =
+-        [ sessionUnitExposedFlag ] ++
+-        [ homeUnitPkgFlag uid
+-        | homeUnitEnv <- Foldable.toList $ hsc_HUG hsc_env
+-        , Just homeUnit <- [homeUnitEnv_home_unit homeUnitEnv]
+-        , let uid = homeUnitId homeUnit
+-        ] ++
+-        (packageFlags dflags0)
++        concat
++          [ [ sessionUnitExposedFlag ]
++          , [ homeUnitPkgFlag uid
++            | homeUnitEnv <- Foldable.toList $ hsc_HUG hsc_env
++            , Just homeUnit <- [homeUnitEnv_home_unit homeUnitEnv]
++            , let uid = homeUnitId homeUnit
++            ]
++          , packageFlags dflags0
++          ]
+       , importPaths = []
+       }
+ 
+   let
+     -- Explicitly depends on all current home units.
+-    -- Additionally, we remove all 'importPaths', to avoid accidentally adding
+-    -- any 'Target's to this 'Unit' that are not ':load'ed.
+     dflagsSession =
+       setHomeUnitId interactiveSessionUnitId $ dflags
+         { packageFlags =
+-          [ homeUnitPkgFlag uid
+-          | homeUnitEnv <- Foldable.toList $ hsc_HUG hsc_env
+-          , Just homeUnit <- [homeUnitEnv_home_unit homeUnitEnv]
+-          , let uid = homeUnitId homeUnit
+-          ] ++
+-          (packageFlags dflags)
+-        , importPaths = []
++          concat
++            [ [ homeUnitPkgFlag uid
++              | homeUnitEnv <- Foldable.toList $ hsc_HUG hsc_env
++              , Just homeUnit <- [homeUnitEnv_home_unit homeUnitEnv]
++              , let uid = homeUnitId homeUnit
++              ]
++            , packageFlags dflags
++            ]
+         }
+ 
+   let
+diff --git a/ghc/Main.hs b/ghc/Main.hs
+index 080b8271be..c467372f8b 100644
+--- a/ghc/Main.hs
++++ b/ghc/Main.hs
+@@ -293,6 +293,7 @@ ghciUI _ _ _ =
+   throwGhcException (CmdLineError "not built for interactive use")
+ #else
+ ghciUI units srcs maybe_expr = do
++  initFlags <- getDynFlags
+   hs_srcs <- case NE.nonEmpty units of
+     Just ne_units -> do
+       initMulti ne_units (checkOptions DoMake)
+@@ -303,7 +304,7 @@ ghciUI units srcs maybe_expr = do
+           s <- initMake srcs
+           dflags <- getDynFlags
+           return $ map (uncurry (,Just $ homeUnitId_ dflags,)) s
+-  interactiveUI defaultGhciSettings hs_srcs maybe_expr
++  interactiveUI defaultGhciSettings initFlags hs_srcs maybe_expr
+ #endif
+ 
+ -- ----------------------------------------------------------------------------
+diff --git a/testsuite/tests/ghci/prog018/prog018.stdout b/testsuite/tests/ghci/prog018/prog018.stdout
+index 65cf11b437..b6f1acc9b7 100644
+--- a/testsuite/tests/ghci/prog018/prog018.stdout
++++ b/testsuite/tests/ghci/prog018/prog018.stdout
+@@ -1,5 +1,5 @@
+-[1 of 3] Compiling A                ( A.hs, interpreted )[main]
+-[2 of 3] Compiling B                ( B.hs, interpreted )[main]
++[1 of 3] Compiling A                ( A.hs, interpreted )[interactive-session]
++[2 of 3] Compiling B                ( B.hs, interpreted )[interactive-session]
+ [3 of 3] Compiling C                ( C.hs, interpreted )[interactive-session]
+ A.hs:5:1: warning: [GHC-62161] [-Wincomplete-patterns (in -Wextra)]
+     Pattern match(es) are non-exhaustive
+diff --git a/testsuite/tests/ghci/prog020/Makefile b/testsuite/tests/ghci/prog020/Makefile
+index 0c064055c8..fc9e811e08 100644
+--- a/testsuite/tests/ghci/prog020/Makefile
++++ b/testsuite/tests/ghci/prog020/Makefile
+@@ -2,7 +2,12 @@ TOP=../../..
+ include $(TOP)/mk/boilerplate.mk
+ include $(TOP)/mk/test.mk
+ 
+-.PHONY: ghci.prog020
+-ghci.prog020:
++.PHONY: ghci.prog020a
++ghci.prog020a:
+ 	'$(TEST_HC)' $(TEST_HC_OPTS) $(WAY_FLAGS) $(ghciWayFlags) -v0 A.hs B.hs
+-	'$(TEST_HC)' $(TEST_HC_OPTS_INTERACTIVE) $(WAY_FLAGS) $(ghciWayFlags) -v0 -i -i. A B < ghci.prog020.script
++	'$(TEST_HC)' $(TEST_HC_OPTS_INTERACTIVE) $(WAY_FLAGS) $(ghciWayFlags) -v0 -i -i. A B < ghci.prog020a.script
++
++.PHONY: ghci.prog020b
++ghci.prog020b:
++	'$(TEST_HC)' $(TEST_HC_OPTS) $(WAY_FLAGS) $(ghciWayFlags) -v0 A.hs B.hs
++	'$(TEST_HC)' $(TEST_HC_OPTS_INTERACTIVE) $(WAY_FLAGS) $(ghciWayFlags) -v0 -i -i. A B < ghci.prog020b.script
+diff --git a/testsuite/tests/ghci/prog020/all.T b/testsuite/tests/ghci/prog020/all.T
+index d3521353fd..a9122c8bf7 100644
+--- a/testsuite/tests/ghci/prog020/all.T
++++ b/testsuite/tests/ghci/prog020/all.T
+@@ -1,6 +1,13 @@
+-test('ghci.prog020',
++test('ghci.prog020a',
+      [req_interp,
+       cmd_prefix('ghciWayFlags=' + config.ghci_way_flags),
+-      extra_files(['A.hs', 'B.hs', 'ghci.prog020.script'])
++      extra_files(['A.hs', 'B.hs', 'ghci.prog020a.script'])
+      ],
+-     makefile_test, ['ghci.prog020'])
++     makefile_test, ['ghci.prog020a'])
++
++test('ghci.prog020b',
++     [req_interp,
++      cmd_prefix('ghciWayFlags=' + config.ghci_way_flags),
++      extra_files(['A.hs', 'B.hs', 'ghci.prog020b.script'])
++     ],
++     makefile_test, ['ghci.prog020b'])
+diff --git a/testsuite/tests/ghci/prog020/ghci.prog020.script b/testsuite/tests/ghci/prog020/ghci.prog020a.script
+similarity index 100%
+rename from testsuite/tests/ghci/prog020/ghci.prog020.script
+rename to testsuite/tests/ghci/prog020/ghci.prog020a.script
+diff --git a/testsuite/tests/ghci/prog020/ghci.prog020.stderr b/testsuite/tests/ghci/prog020/ghci.prog020a.stderr
+similarity index 100%
+rename from testsuite/tests/ghci/prog020/ghci.prog020.stderr
+rename to testsuite/tests/ghci/prog020/ghci.prog020a.stderr
+diff --git a/testsuite/tests/ghci/prog020/ghci.prog020.stdout b/testsuite/tests/ghci/prog020/ghci.prog020a.stdout
+similarity index 100%
+rename from testsuite/tests/ghci/prog020/ghci.prog020.stdout
+rename to testsuite/tests/ghci/prog020/ghci.prog020a.stdout
+diff --git a/testsuite/tests/ghci/prog020/ghci.prog020b.script b/testsuite/tests/ghci/prog020/ghci.prog020b.script
+new file mode 100644
+index 0000000000..33faa8bc8e
+--- /dev/null
++++ b/testsuite/tests/ghci/prog020/ghci.prog020b.script
+@@ -0,0 +1,12 @@
++-- test that we can reuse object files
++
++import A
++import B
++f 10
++-- Not in scope
++g 10
++
++
++-- Can't load interpreted as they are using object code
++:m *A *B
++g 10
+diff --git a/testsuite/tests/ghci/prog020/ghci.prog020b.stderr b/testsuite/tests/ghci/prog020/ghci.prog020b.stderr
+new file mode 100644
+index 0000000000..d188f0bd58
+--- /dev/null
++++ b/testsuite/tests/ghci/prog020/ghci.prog020b.stderr
+@@ -0,0 +1,7 @@
++<interactive>:7:1: error: [GHC-88464]
++    Variable not in scope: g :: t0 -> t
++
++module 'A' is not interpreted; try ':add *A' first
++<interactive>:12:1: error: [GHC-88464]
++    Variable not in scope: g :: t0 -> t
++
+diff --git a/testsuite/tests/ghci/prog020/ghci.prog020b.stdout b/testsuite/tests/ghci/prog020/ghci.prog020b.stdout
+new file mode 100644
+index 0000000000..2a421cccfc
+--- /dev/null
++++ b/testsuite/tests/ghci/prog020/ghci.prog020b.stdout
+@@ -0,0 +1 @@
++[10]
+diff --git a/testsuite/tests/ghci/prog023/prog023b.stderr b/testsuite/tests/ghci/prog023/prog023b.stderr
+deleted file mode 100644
+index 33f07d96b0..0000000000
+--- a/testsuite/tests/ghci/prog023/prog023b.stderr
++++ /dev/null
+@@ -1,4 +0,0 @@
+-<no location info>: error: [GHC-49196] Can't find src/A.hs
+-
+-<interactive>:2:1: error: [GHC-88464] Variable not in scope: foo
+-
+diff --git a/testsuite/tests/ghci/prog023/prog023b.stdout b/testsuite/tests/ghci/prog023/prog023b.stdout
+new file mode 100644
+index 0000000000..68f4d67d58
+--- /dev/null
++++ b/testsuite/tests/ghci/prog023/prog023b.stdout
+@@ -0,0 +1 @@
++"Called foo"
+diff --git a/testsuite/tests/ghci/prog024/prog024a.stderr b/testsuite/tests/ghci/prog024/prog024a.stderr
+deleted file mode 100644
+index 14923ac646..0000000000
+--- a/testsuite/tests/ghci/prog024/prog024a.stderr
++++ /dev/null
+@@ -1,7 +0,0 @@
+-<no location info>: error: [GHC-82272]
+-    module ‘B’ cannot be found locally
+-
+-<interactive>:2:1: error: [GHC-88464] Variable not in scope: foo
+-
+-<interactive>:3:1: error: [GHC-88464] Variable not in scope: bar
+-
+diff --git a/testsuite/tests/ghci/prog024/prog024a.stdout b/testsuite/tests/ghci/prog024/prog024a.stdout
+new file mode 100644
+index 0000000000..e17b54dd54
+--- /dev/null
++++ b/testsuite/tests/ghci/prog024/prog024a.stdout
+@@ -0,0 +1,2 @@
++"Called foo"
++"Called bar"
+diff --git a/testsuite/tests/ghci/prog024/prog024c.script b/testsuite/tests/ghci/prog024/prog024c.script
+index 975e460c53..e82e0ac9b8 100644
+--- a/testsuite/tests/ghci/prog024/prog024c.script
++++ b/testsuite/tests/ghci/prog024/prog024c.script
+@@ -1,3 +1,6 @@
+ :load A B
+ foo
+ bar
++B.bar
++:m + B
++bar
+diff --git a/testsuite/tests/ghci/prog024/prog024c.stderr b/testsuite/tests/ghci/prog024/prog024c.stderr
+index 2687d4a31a..6669f94ff4 100644
+--- a/testsuite/tests/ghci/prog024/prog024c.stderr
++++ b/testsuite/tests/ghci/prog024/prog024c.stderr
+@@ -1,10 +1,2 @@
+-<no location info>: error: [GHC-82272]
+-    module ‘A’ cannot be found locally
+-
+-<no location info>: error: [GHC-82272]
+-    module ‘B’ cannot be found locally
+-
+-<interactive>:2:1: error: [GHC-88464] Variable not in scope: foo
+-
+ <interactive>:3:1: error: [GHC-88464] Variable not in scope: bar
+ 
+diff --git a/testsuite/tests/ghci/prog024/prog024c.stdout b/testsuite/tests/ghci/prog024/prog024c.stdout
+new file mode 100644
+index 0000000000..9296454de1
+--- /dev/null
++++ b/testsuite/tests/ghci/prog024/prog024c.stdout
+@@ -0,0 +1,3 @@
++"Called foo"
++"Called bar"
++"Called bar"
+diff --git a/testsuite/tests/ghci/prog024/prog024d.script b/testsuite/tests/ghci/prog024/prog024d.script
+index 304b1aef9e..6fd87fe243 100644
+--- a/testsuite/tests/ghci/prog024/prog024d.script
++++ b/testsuite/tests/ghci/prog024/prog024d.script
+@@ -1,3 +1,6 @@
+ :load src/A.hs src/B.hs
+ foo
+ bar
++B.bar
++:m + B
++bar
+diff --git a/testsuite/tests/ghci/prog024/prog024d.stdout b/testsuite/tests/ghci/prog024/prog024d.stdout
+index 68f4d67d58..9296454de1 100644
+--- a/testsuite/tests/ghci/prog024/prog024d.stdout
++++ b/testsuite/tests/ghci/prog024/prog024d.stdout
+@@ -1 +1,3 @@
+ "Called foo"
++"Called bar"
++"Called bar"
+diff --git a/testsuite/tests/ghci/scripts/T13997.stdout b/testsuite/tests/ghci/scripts/T13997.stdout
+index 912cb3c919..ddeeb7992b 100644
+--- a/testsuite/tests/ghci/scripts/T13997.stdout
++++ b/testsuite/tests/ghci/scripts/T13997.stdout
+@@ -1,8 +1,8 @@
+-[1 of 2] Compiling Bug2             ( Bug2.hs, Bug2.o )[main]
++[1 of 2] Compiling Bug2             ( Bug2.hs, Bug2.o )[interactive-session]
+ [2 of 2] Compiling Bug              ( Bug.hs, Bug.o )[interactive-session]
+ Ok, two modules loaded.
+-[1 of 3] Compiling New              ( New.hs, New.o )[main]
+-[2 of 3] Compiling Bug2             ( Bug2.hs, Bug2.o )[main] [Source file changed]
++[1 of 3] Compiling New              ( New.hs, New.o )[interactive-session]
++[2 of 3] Compiling Bug2             ( Bug2.hs, Bug2.o )[interactive-session] [Source file changed]
+ [3 of 3] Compiling Bug              ( Bug.hs, Bug.o )[interactive-session] [Bug2 changed]
+ Ok, three modules reloaded.
+ True
+diff --git a/testsuite/tests/ghci/scripts/T1914.stdout b/testsuite/tests/ghci/scripts/T1914.stdout
+index 9a7a8a4c5a..caa6751e20 100644
+--- a/testsuite/tests/ghci/scripts/T1914.stdout
++++ b/testsuite/tests/ghci/scripts/T1914.stdout
+@@ -1,4 +1,4 @@
+-[1 of 2] Compiling T1914B           ( T1914B.hs, interpreted )[main]
++[1 of 2] Compiling T1914B           ( T1914B.hs, interpreted )[interactive-session]
+ [2 of 2] Compiling T1914A           ( T1914A.hs, interpreted )[interactive-session]
+ Ok, two modules loaded.
+ [2 of 2] Compiling T1914A           ( T1914A.hs, interpreted )[interactive-session] [Source file changed]
+diff --git a/testsuite/tests/ghci/scripts/T20217.stdout b/testsuite/tests/ghci/scripts/T20217.stdout
+index fec35c5648..825081cbb6 100644
+--- a/testsuite/tests/ghci/scripts/T20217.stdout
++++ b/testsuite/tests/ghci/scripts/T20217.stdout
+@@ -1,5 +1,5 @@
+-[1 of 3] Compiling T20217A[boot]    ( T20217A.hs-boot, nothing )[main]
+-[2 of 3] Compiling T20217A          ( T20217A.hs, nothing )[main]
++[1 of 3] Compiling T20217A[boot]    ( T20217A.hs-boot, nothing )[interactive-session]
++[2 of 3] Compiling T20217A          ( T20217A.hs, nothing )[interactive-session]
+ [3 of 3] Compiling T20217           ( T20217.hs, nothing )[interactive-session]
+ Ok, three modules loaded.
+ Ok, three modules reloaded.
+diff --git a/testsuite/tests/ghci/scripts/T8042.stdout b/testsuite/tests/ghci/scripts/T8042.stdout
+index a83c10e7cd..548b88b71d 100644
+--- a/testsuite/tests/ghci/scripts/T8042.stdout
++++ b/testsuite/tests/ghci/scripts/T8042.stdout
+@@ -1,9 +1,9 @@
+-[1 of 3] Compiling T8042B           ( T8042B.hs, T8042B.o )[main]
+-[2 of 3] Compiling T8042C           ( T8042C.hs, interpreted )[main]
++[1 of 3] Compiling T8042B           ( T8042B.hs, T8042B.o )[interactive-session]
++[2 of 3] Compiling T8042C           ( T8042C.hs, interpreted )[interactive-session]
+ [3 of 3] Compiling T8042A           ( T8042A.hs, interpreted )[interactive-session]
+ Ok, three modules loaded.
+ [3 of 3] Compiling T8042A           ( T8042A.hs, T8042A.o )[interactive-session] [Source file changed]
+ Ok, three modules reloaded.
+-[2 of 3] Compiling T8042C           ( T8042C.hs, interpreted )[main]
++[2 of 3] Compiling T8042C           ( T8042C.hs, interpreted )[interactive-session]
+ [3 of 3] Compiling T8042A           ( T8042A.hs, interpreted )[interactive-session]
+ Ok, three modules loaded.
+diff --git a/testsuite/tests/ghci/scripts/T8042recomp.stdout b/testsuite/tests/ghci/scripts/T8042recomp.stdout
+index 98d7a84de6..2fbfd4f927 100644
+--- a/testsuite/tests/ghci/scripts/T8042recomp.stdout
++++ b/testsuite/tests/ghci/scripts/T8042recomp.stdout
+@@ -1,4 +1,4 @@
+-[1 of 2] Compiling T8042B           ( T8042B.hs, T8042B.o )[main]
++[1 of 2] Compiling T8042B           ( T8042B.hs, T8042B.o )[interactive-session]
+ [2 of 2] Compiling T8042A           ( T8042A.hs, T8042A.o )[interactive-session]
+ Ok, two modules loaded.
+ [2 of 2] Compiling T8042A           ( T8042A.hs, interpreted )[interactive-session]
+diff --git a/testsuite/tests/ghci/should_run/T10920.stderr b/testsuite/tests/ghci/should_run/T10920.stderr
+index 00391d0f0a..3afefce22d 100644
+--- a/testsuite/tests/ghci/should_run/T10920.stderr
++++ b/testsuite/tests/ghci/should_run/T10920.stderr
+@@ -1,3 +1,3 @@
+ <interactive>:1:1: error: [GHC-58427]
+-    attempting to use module ‘main:Prelude’ (./Prelude.hs) which is not loaded
++    attempting to use module ‘interactive-session:Prelude’ (./Prelude.hs) which is not loaded
+ 

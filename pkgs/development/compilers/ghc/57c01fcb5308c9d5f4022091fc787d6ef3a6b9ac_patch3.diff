@@ -1,0 +1,311 @@
+commit 57c01fcb5308c9d5f4022091fc787d6ef3a6b9ac
+Author: Matthew Pickering <matthewtpickering@gmail.com>
+Date:   Tue Mar 17 15:28:13 2026 +0000
+
+    Introduce `ModuleNameProvidersMap` use for home units
+    
+    This contribution introduces a home modules cache to the module graph
+    and changes the finder to use that cache to cut down home unit search
+    work. The particular changes are as follows:
+    
+      * In `GHC.Unit.Module.Graph`, `ModuleGraph` is extended with a new
+        field `mg_home_map`, exposed as `mgHomeModuleMap`. This is a data
+        structure that caches the following:
+            - The set of home units for which the graph has a complete
+              module listing
+            - For each module name, the set of home unit IDs that define it
+        Operations that construct module graphs are updated such that this
+        cache stays synchronized.
+      * In `GHC.Unit.Finder`, `findImportedModule` is changed to pull
+        `mgHomeModuleMap` from `hsc_mod_graph` and pass it to
+        `findImportedModuleNoHsc`, which first consults the cache to find
+        the home unit of the respective module and only falls back to the
+        usual search when that home unit could not be found via the cache.
+    
+    The practical effect is that for unqualified and `this-package` imports,
+    the finder avoids blindly searching every home unit dependency when the
+    current module graph already states which units may provide that module.
+    This is a performance optimization, especially for multi-home-unit
+    builds.
+    
+    Resolves #27055.
+    
+    Co-authored-by: Wolfgang Jeltsch <wolfgang@well-typed.com>
+
+diff --git a/compiler/GHC/Unit/Finder.hs b/compiler/GHC/Unit/Finder.hs
+index 4fca184410..c59847e848 100644
+--- a/compiler/GHC/Unit/Finder.hs
++++ b/compiler/GHC/Unit/Finder.hs
+@@ -44,6 +44,7 @@ import GHC.Data.OsPath
+ import GHC.Unit.Env
+ import GHC.Unit.Types
+ import GHC.Unit.Module
++import GHC.Unit.Module.Graph (ModuleNameHomeMap (..), mgHomeModuleMap)
+ import GHC.Unit.Home
+ import GHC.Unit.Home.Graph (UnitEnvGraph)
+ import qualified GHC.Unit.Home.Graph as HUG
+@@ -72,7 +73,7 @@ import GHC.Driver.Config.Finder
+ import GHC.Types.Unique.Set
+ import qualified Data.List as L(sort)
+ import Data.List.NonEmpty ( NonEmpty (..) )
+-import qualified Data.Set as Set (toList)
++import qualified Data.Set as Set
+ import qualified System.Directory as SD
+ import qualified System.OsPath as OsPath
+ import qualified Data.List.NonEmpty as NE
+@@ -182,7 +183,8 @@ findImportedModule hsc_env mod pkg_qual =
+       dflags    = hsc_dflags hsc_env
+       fopts     = initFinderOpts dflags
+   in do
+-    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) mhome_unit mod pkg_qual
++    let home_module_map = mgHomeModuleMap (hsc_mod_graph hsc_env)
++    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) home_module_map mhome_unit mod pkg_qual
+ 
+ findImportedModuleWithIsBoot :: HscEnv -> ModuleName -> IsBootInterface -> PkgQual -> IO FindResult
+ findImportedModuleWithIsBoot hsc_env mod is_boot pkg_qual = do
+@@ -195,22 +197,27 @@ findImportedModuleNoHsc
+   :: FinderCache
+   -> FinderOpts
+   -> UnitEnv
++  -> ModuleNameHomeMap
+   -> Maybe HomeUnit
+   -> ModuleName
+   -> PkgQual
+   -> IO FindResult
+-findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
++findImportedModuleNoHsc fc fopts ue home_module_map mhome_unit mod_name mb_pkg =
+   case mb_pkg of
+     NoPkgQual  -> unqual_import
+     ThisPkg uid | (homeUnitId <$> mhome_unit) == Just uid -> home_import
+-                | Just os <- lookup uid other_fopts -> home_pkg_import (uid, os)
++                | Just os <- M.lookup uid other_fopts_map -> home_pkg_import (uid, os)
+                 | otherwise -> pprPanic "findImportModule" (ppr mod_name $$ ppr mb_pkg $$ ppr (homeUnitId <$> mhome_unit) $$ ppr uid $$ ppr (map fst all_opts))
+     OtherPkg _ -> pkg_import
+   where
++    ModuleNameHomeMap complete_units module_name_map = home_module_map
++    module_home_units = M.findWithDefault Set.empty mod_name module_name_map
++    current_unit_id = homeUnitId <$> mhome_unit
+     all_opts = case mhome_unit of
+-                Nothing -> other_fopts
+-                Just home_unit -> (homeUnitId home_unit, fopts) : other_fopts
++                Nothing -> other_fopts_list
++                Just home_unit -> (homeUnitId home_unit, fopts) : other_fopts_list
+ 
++    other_fopts_map = M.fromList other_fopts_list
+ 
+     home_import = case mhome_unit of
+                    Just home_unit -> findHomeModule fc fopts home_unit mod_name
+@@ -221,7 +228,7 @@ findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
+       -- If the module is reexported, then look for it as if it was from the perspective
+       -- of that package which reexports it.
+       | Just real_mod_name <- lookupUniqMap (finder_reexportedModules opts) mod_name =
+-        findImportedModuleNoHsc fc opts ue (Just $ DefiniteHomeUnit uid Nothing) real_mod_name NoPkgQual
++        findImportedModuleNoHsc fc opts ue home_module_map (Just $ DefiniteHomeUnit uid Nothing) real_mod_name NoPkgQual
+       | elementOfUniqSet mod_name (finder_hiddenModules opts) =
+         return (mkHomeHidden uid)
+       | otherwise =
+@@ -230,7 +237,7 @@ findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
+     -- Do not be smart and change this to `foldr orIfNotFound home_import hs` as
+     -- that is not the same!! home_import is first because we need to look within ourselves
+     -- first before looking at the packages in order.
+-    any_home_import = foldr1 orIfNotFound (home_import:| map home_pkg_import other_fopts)
++    any_home_import = foldr1 orIfNotFound (home_import :| map home_pkg_import other_fopts_list)
+ 
+     pkg_import    = findExposedPackageModule fc fopts units  mod_name mb_pkg
+ 
+@@ -241,9 +248,21 @@ findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
+     units     = case mhome_unit of
+                   Nothing -> ue_homeUnitState ue
+                   Just home_unit -> HUG.homeUnitEnv_units $ ue_findHomeUnitEnv (homeUnitId home_unit) ue
+-    hpt_deps :: [UnitId]
+-    hpt_deps  = Set.toList (homeUnitDepends units)
+-    other_fopts  = map (\uid -> (uid, initFinderOpts (homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)))) hpt_deps
++    hpt_deps :: Set.Set UnitId
++    hpt_deps = homeUnitDepends units
++    dep_providers = Set.intersection module_home_units hpt_deps
++    known_other_uids =
++      let providers = maybe dep_providers (\u -> Set.delete u dep_providers) current_unit_id
++      in Set.toList providers
++    unknown_units =
++      let candidates = Set.difference hpt_deps complete_units
++          excluded = maybe dep_providers (\u -> Set.insert u dep_providers) current_unit_id
++      in Set.toList (Set.difference candidates excluded)
++    other_home_uids = known_other_uids ++ unknown_units
++    other_fopts_list =
++      [ (uid, initFinderOpts (homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)))
++      | uid <- other_home_uids
++      ]
+ 
+ -- | Locate a plugin module requested by the user, for a compiler
+ -- plugin.  This consults the same set of exposed packages as
+diff --git a/compiler/GHC/Unit/Module/Graph.hs b/compiler/GHC/Unit/Module/Graph.hs
+index 32345ad415..aba5179560 100644
+--- a/compiler/GHC/Unit/Module/Graph.hs
++++ b/compiler/GHC/Unit/Module/Graph.hs
+@@ -67,6 +67,8 @@ module GHC.Unit.Module.Graph
+    , mgLookupModule
+    , mgLookupModuleName
+    , mgHasHoles
++   , ModuleNameHomeMap (ModuleNameHomeMap)
++   , mgHomeModuleMap
+    , showModMsg
+ 
+     -- ** Reachability queries
+@@ -156,10 +158,11 @@ import GHC.Unit.Module.ModIface
+ import GHC.Utils.Misc ( partitionWith )
+ 
+ import System.FilePath
++import Data.Set (Set)
++import qualified Data.Set as Set
++import Data.Map (Map)
+ import qualified Data.Map as Map
+ import GHC.Types.Unique.DSet
+-import qualified Data.Set as Set
+-import Data.Set (Set)
+ import GHC.Unit.Module
+ import GHC.Unit.Module.ModNodeKey
+ import GHC.Unit.Module.Stage
+@@ -202,14 +205,47 @@ data ModuleGraph = ModuleGraph
+   -- Cached computation, whether any of the ModuleGraphNode are isHoleModule,
+   -- This is only used for a hack in GHC.Iface.Load to do with backpack, please
+   -- remove this at the earliest opportunity.
++  , mg_home_map :: ModuleNameHomeMap
++    -- ^ For each module name, which home unit UnitIds define it together with the set of units for which the listing is complete.
+   }
+ 
++data ModuleNameHomeMap = ModuleNameHomeMap !(Set UnitId)
++                                           !(Map ModuleName (Set UnitId))
++
++mkHomeModuleMap :: [ModuleGraphNode] -> ModuleNameHomeMap
++mkHomeModuleMap nodes = ModuleNameHomeMap completeUnits providerMap where
++
++    providerMap :: Map ModuleName (Set UnitId)
++    providerMap
++        = Map.fromListWith Set.union $
++          [
++              (ms_mod_name modSummary, Set.singleton (ms_unitid modSummary)) |
++                  ModuleNode _ (ModuleNodeCompile modSummary) <- nodes
++          ]
++
++    completeUnits :: Set UnitId
++    completeUnits
++        = Set.fromList $
++          [
++              ms_unitid modSummary |
++                  ModuleNode _ (ModuleNodeCompile modSummary) <- nodes
++          ]
++
++    {-NOTE:
++        The matching with `ModuleNodeCompile` results in nodes with
++        `ModuleNodeFixed` in their info being dropped.
++    -}
++
++mgHomeModuleMap :: ModuleGraph -> ModuleNameHomeMap
++mgHomeModuleMap = mg_home_map
++
+ -- | Why do we ever need to construct empty graphs? Is it because of one shot mode?
+ emptyMG :: ModuleGraph
+ emptyMG = ModuleGraph [] (graphReachability emptyGraph, const Nothing)
+                          (graphReachability emptyGraph, const Nothing)
+                          (graphReachability emptyGraph, const Nothing)
+                          False
++                         (ModuleNameHomeMap Set.empty Map.empty)
+ 
+ -- | Construct a module graph. This function should be the only entry point for
+ -- building a 'ModuleGraph', since it is supposed to be built once and never modified.
+@@ -308,7 +344,7 @@ checkModuleGraph ModuleGraph{..} =
+   where
+     duplicate_errs = rights (Map.elems node_types)
+ 
+-    node_types :: Map.Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
++    node_types :: Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
+     node_types = Map.fromListWithKey go [ (mkNodeKey n, Left (moduleNodeType n)) | n <- mg_mss ]
+       where
+         -- Multiple nodes with the same key are not allowed.
+@@ -319,7 +355,7 @@ checkModuleGraph ModuleGraph{..} =
+ 
+ -- | Check that all dependencies in the graph are present in the node_types map.
+ -- This is a helper function used by checkModuleGraph.
+-checkAllDependenciesInGraph :: Map.Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
++checkAllDependenciesInGraph :: Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
+                             -> ModuleGraphNode
+                             -> Maybe ModuleGraphInvariantError
+ checkAllDependenciesInGraph node_types node =
+@@ -334,7 +370,7 @@ checkAllDependenciesInGraph node_types node =
+ -- | Check if for the fixed module node invariant:
+ --
+ --   Fixed nodes can only depend on other fixed nodes.
+-checkFixedModuleInvariant :: Map.Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
++checkFixedModuleInvariant :: Map NodeKey (Either ModuleNodeType ModuleGraphInvariantError)
+                 -> ModuleGraphNode
+                 -> Maybe ModuleGraphInvariantError
+ checkFixedModuleInvariant node_types node = case node of
+@@ -484,13 +520,17 @@ isEmptyMG = null . mg_mss
+ -- To preserve invariants, 'f' can't change the isBoot status.
+ mapMG :: (ModSummary -> ModSummary) -> ModuleGraph -> ModuleGraph
+ mapMG f mg@ModuleGraph{..} = mg
+-  { mg_mss = flip fmap mg_mss $ \case
+-      InstantiationNode uid iuid -> InstantiationNode uid iuid
+-      LinkNode uid nks -> LinkNode uid nks
+-      ModuleNode deps (ModuleNodeFixed key loc)  -> ModuleNode deps (ModuleNodeFixed key loc)
+-      ModuleNode deps (ModuleNodeCompile ms) -> ModuleNode deps (ModuleNodeCompile (f ms))
+-      UnitNode deps uid -> UnitNode deps uid
++  { mg_mss = new_mss
++  , mg_home_map = mkHomeModuleMap new_mss
+   }
++  where
++    new_mss =
++      flip fmap mg_mss $ \case
++        InstantiationNode uid iuid -> InstantiationNode uid iuid
++        LinkNode uid nks -> LinkNode uid nks
++        ModuleNode deps (ModuleNodeFixed key loc)  -> ModuleNode deps (ModuleNodeFixed key loc)
++        ModuleNode deps (ModuleNodeCompile ms) -> ModuleNode deps (ModuleNodeCompile (f ms))
++        UnitNode deps uid -> UnitNode deps uid
+ 
+ -- | Map a function 'f' over all the 'ModSummaries', in 'IO'.
+ -- To preserve invariants, 'f' can't change the isBoot status.
+@@ -856,7 +896,7 @@ moduleNodeInfoBootString mn@(ModuleNodeFixed {}) =
+ -- described in the export list haddocks.
+ --------------------------------------------------------------------------------
+ 
+-newtype NodeMap a = NodeMap { unNodeMap :: Map.Map NodeKey a }
++newtype NodeMap a = NodeMap { unNodeMap :: Map NodeKey a }
+   deriving (Functor, Traversable, Foldable)
+ 
+ -- | Transitive dependencies, including SOURCE edges
+@@ -932,7 +972,7 @@ moduleGraphNodesZero summaries =
+     lookup_key :: ZeroScopeKey -> Maybe Int
+     lookup_key = fmap zeroSummaryNodeKey . lookup_node
+ 
+-    node_map :: Map.Map ZeroScopeKey ZeroSummaryNode
++    node_map :: Map ZeroScopeKey ZeroSummaryNode
+     node_map =
+       Map.fromList [ (s, node)
+                    | node <- nodes
+@@ -1031,7 +1071,7 @@ moduleGraphNodesStages summaries =
+     lookup_key ::  (NodeKey, ModuleStage) -> Maybe Int
+     lookup_key = fmap stageSummaryNodeKey . lookup_node
+ 
+-    node_map :: Map.Map (NodeKey, ModuleStage) StageSummaryNode
++    node_map :: Map (NodeKey, ModuleStage) StageSummaryNode
+     node_map =
+       Map.fromList [ (s, node)
+                    | node <- nodes
+@@ -1049,10 +1089,13 @@ moduleGraphNodesStages summaries =
+ extendMG :: ModuleGraph -> ModuleGraphNode -> ModuleGraph
+ extendMG ModuleGraph{..} node =
+   ModuleGraph
+-    { mg_mss = node : mg_mss
+-    , mg_graph =  mkTransDeps (node : mg_mss)
+-    , mg_loop_graph = mkTransLoopDeps (node : mg_mss)
+-    , mg_zero_graph = mkTransZeroDeps (node : mg_mss)
++    { mg_mss = new_mss
++    , mg_graph =  mkTransDeps new_mss
++    , mg_loop_graph = mkTransLoopDeps new_mss
++    , mg_zero_graph = mkTransZeroDeps new_mss
+     , mg_has_holes = mg_has_holes || maybe False isHsigFile (moduleNodeInfoHscSource =<< mgNodeIsModule node)
++    , mg_home_map = mkHomeModuleMap new_mss
+     }
++  where
++    new_mss = node : mg_mss
+ 
