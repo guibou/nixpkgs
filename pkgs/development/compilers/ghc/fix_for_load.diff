@@ -1,122 +1,240 @@
 diff --git a/compiler/GHC/Unit/Finder.hs b/compiler/GHC/Unit/Finder.hs
-index cb91559cfe..4759ba81b2 100644
+index cb91559cfe..13c477b6da 100644
 --- a/compiler/GHC/Unit/Finder.hs
 +++ b/compiler/GHC/Unit/Finder.hs
-@@ -42,6 +42,7 @@
+@@ -42,6 +42,11 @@
  import GHC.Unit.Env
  import GHC.Unit.Types
  import GHC.Unit.Module
-+import GHC.Unit.Module.Graph (ModuleNameHomeMap (..), mgHomeModuleMap)
++import GHC.Unit.Module.Graph
++       (
++           HomeModuleNameProvidersMap,
++           mgHomeModuleNameProvidersMap
++       )
  import GHC.Unit.Home
  import GHC.Unit.Home.Graph (UnitEnvGraph)
  import qualified GHC.Unit.Home.Graph as HUG
-@@ -69,6 +70,7 @@
+@@ -69,8 +74,13 @@
  import GHC.Driver.Config.Finder
  import qualified Data.Set as Set
  import Data.List.NonEmpty ( NonEmpty (..) )
++import Data.Set (Set)
++import qualified Data.Set as Set (empty, intersection, difference, null, toList)
 +import qualified System.Directory as SD
  import qualified System.OsPath as OsPath
  import qualified Data.List.NonEmpty as NE
++import GHC.Types.Unique.Map
++import GHC.Types.Unique.Set
  
-@@ -156,7 +158,8 @@
-       dflags    = hsc_dflags hsc_env
-       fopts     = initFinderOpts dflags
+ type FileExt = OsString -- Filename extension
+ type BaseName = OsPath  -- Basename of file
+@@ -151,12 +161,13 @@
+ 
+ findImportedModule :: HscEnv -> ModuleName -> PkgQual -> IO FindResult
+ findImportedModule hsc_env mod pkg_qual =
+-  let fc        = hsc_FC hsc_env
+-      mhome_unit = hsc_home_unit_maybe hsc_env
+-      dflags    = hsc_dflags hsc_env
+-      fopts     = initFinderOpts dflags
++  let fc           = hsc_FC hsc_env
++      mb_home_unit = hsc_home_unit_maybe hsc_env
++      dflags       = hsc_dflags hsc_env
++      fopts        = initFinderOpts dflags
    in do
 -    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) mhome_unit mod pkg_qual
-+    let home_module_map = mgHomeModuleMap (hsc_mod_graph hsc_env)
-+    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) home_module_map mhome_unit mod pkg_qual
++    let home_module_name_providers_map = mgHomeModuleNameProvidersMap (hsc_mod_graph hsc_env)
++    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) home_module_name_providers_map mb_home_unit mod pkg_qual
  
  findImportedModuleWithIsBoot :: HscEnv -> ModuleName -> IsBootInterface -> PkgQual -> IO FindResult
  findImportedModuleWithIsBoot hsc_env mod is_boot pkg_qual = do
-@@ -169,22 +172,27 @@
+@@ -169,55 +180,118 @@
    :: FinderCache
    -> FinderOpts
    -> UnitEnv
-+  -> ModuleNameHomeMap
++  -> HomeModuleNameProvidersMap
    -> Maybe HomeUnit
    -> ModuleName
    -> PkgQual
    -> IO FindResult
 -findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
-+findImportedModuleNoHsc fc fopts ue home_module_map mhome_unit mod_name mb_pkg =
++findImportedModuleNoHsc fc fopts ue home_module_name_providers_map mb_home_unit mod_name mb_pkg =
    case mb_pkg of
      NoPkgQual  -> unqual_import
-     ThisPkg uid | (homeUnitId <$> mhome_unit) == Just uid -> home_import
--                | Just os <- lookup uid other_fopts -> home_pkg_import (uid, os)
-+                | Just os <- M.lookup uid other_fopts_map -> home_pkg_import (uid, os)
-                 | otherwise -> pprPanic "findImportModule" (ppr mod_name $$ ppr mb_pkg $$ ppr (homeUnitId <$> mhome_unit) $$ ppr uid $$ ppr (map fst all_opts))
+-    ThisPkg uid | (homeUnitId <$> mhome_unit) == Just uid -> home_import
++    ThisPkg uid | (homeUnitId <$> mb_home_unit) == Just uid -> home_import
+                 | Just os <- lookup uid other_fopts -> home_pkg_import (uid, os)
+-                | otherwise -> pprPanic "findImportModule" (ppr mod_name $$ ppr mb_pkg $$ ppr (homeUnitId <$> mhome_unit) $$ ppr uid $$ ppr (map fst all_opts))
++                | otherwise -> pprPanic "findImportModule" (ppr mod_name $$ ppr mb_pkg $$ ppr (homeUnitId <$> mb_home_unit) $$ ppr uid $$ ppr (map fst all_opts))
      OtherPkg _ -> pkg_import
    where
-+    ModuleNameHomeMap complete_units module_name_map = home_module_map
-+    module_home_units = M.findWithDefault Set.empty mod_name module_name_map
-+    current_unit_id = homeUnitId <$> mhome_unit
-     all_opts = case mhome_unit of
+-    all_opts = case mhome_unit of
 -                Nothing -> other_fopts
 -                Just home_unit -> (homeUnitId home_unit, fopts) : other_fopts
-+                Nothing -> other_fopts_list
-+                Just home_unit -> (homeUnitId home_unit, fopts) : other_fopts_list
  
-+    other_fopts_map = M.fromList other_fopts_list
++    mb_home_unit_id :: Maybe UnitId
++    mb_home_unit_id = homeUnitId <$> mb_home_unit
  
-     home_import = case mhome_unit of
-                    Just home_unit -> findHomeModule fc fopts home_unit mod_name
-@@ -195,7 +203,7 @@
-       -- If the module is reexported, then look for it as if it was from the perspective
-       -- of that package which reexports it.
-       | Just real_mod_name <- mod_name `M.lookup` finder_reexportedModules opts =
+-    home_import = case mhome_unit of
+-                   Just home_unit -> findHomeModule fc fopts home_unit mod_name
+-                   Nothing -> pure $ NoPackage (panic "findImportedModule: no home-unit")
++    all_opts :: [(UnitId, FinderOpts)]
++    all_opts = case mb_home_unit_id of
++        Nothing           -> other_fopts
++        Just home_unit_id -> (home_unit_id, fopts) : other_fopts
+ 
++    home_import :: IO FindResult
++    home_import = case mb_home_unit of
++        Just home_unit -> findHomeModule fc fopts home_unit mod_name
++        Nothing        -> pure $
++                          NoPackage (panic "findImportedModule: no home-unit")
+ 
++    {-
++        If the module is reexported, then look for it as if it was from the
++        perspective of that package which reexports it.
++    -}
++    home_pkg_import :: (UnitId, FinderOpts) -> IO FindResult
+     home_pkg_import (uid, opts)
+-      -- If the module is reexported, then look for it as if it was from the perspective
+-      -- of that package which reexports it.
+-      | Just real_mod_name <- mod_name `M.lookup` finder_reexportedModules opts =
 -        findImportedModuleNoHsc fc opts ue (Just $ DefiniteHomeUnit uid Nothing) real_mod_name NoPkgQual
-+        findImportedModuleNoHsc fc opts ue home_module_map (Just $ DefiniteHomeUnit uid Nothing) real_mod_name NoPkgQual
-       | mod_name `Set.member` finder_hiddenModules opts =
-         return (mkHomeHidden uid)
-       | otherwise =
-@@ -204,7 +212,7 @@
-     -- Do not be smart and change this to `foldr orIfNotFound home_import hs` as
-     -- that is not the same!! home_import is first because we need to look within ourselves
-     -- first before looking at the packages in order.
+-      | mod_name `Set.member` finder_hiddenModules opts =
+-        return (mkHomeHidden uid)
+-      | otherwise =
+-        findHomePackageModule fc opts uid mod_name
+-
+-    -- Do not be smart and change this to `foldr orIfNotFound home_import hs` as
+-    -- that is not the same!! home_import is first because we need to look within ourselves
+-    -- first before looking at the packages in order.
 -    any_home_import = foldr1 orIfNotFound (home_import:| map home_pkg_import other_fopts)
-+    any_home_import = foldr1 orIfNotFound (home_import :| map home_pkg_import other_fopts_list)
- 
-     pkg_import    = findExposedPackageModule fc fopts units  mod_name mb_pkg
- 
-@@ -215,9 +223,21 @@
-     units     = case mhome_unit of
-                   Nothing -> ue_homeUnitState ue
-                   Just home_unit -> HUG.homeUnitEnv_units $ ue_findHomeUnitEnv (homeUnitId home_unit) ue
+-
+-    pkg_import    = findExposedPackageModule fc fopts units  mod_name mb_pkg
+-
+-    unqual_import = any_home_import
+-                    `orIfNotFound`
+-                    findExposedPackageModule fc fopts units mod_name NoPkgQual
+-
+-    units     = case mhome_unit of
+-                  Nothing -> ue_homeUnitState ue
+-                  Just home_unit -> HUG.homeUnitEnv_units $ ue_findHomeUnitEnv (homeUnitId home_unit) ue
 -    hpt_deps :: [UnitId]
 -    hpt_deps  = homeUnitDepends units
 -    other_fopts  = map (\uid -> (uid, initFinderOpts (homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)))) hpt_deps
-+    hpt_deps :: Set.Set UnitId
-+    hpt_deps = Set.fromList (homeUnitDepends units)
-+    dep_providers = Set.intersection module_home_units hpt_deps
-+    known_other_uids =
-+      let providers = maybe dep_providers (\u -> Set.delete u dep_providers) current_unit_id
-+      in Set.toList providers
-+    unknown_units =
-+      let candidates = Set.difference hpt_deps complete_units
-+          excluded = maybe dep_providers (\u -> Set.insert u dep_providers) current_unit_id
-+      in Set.toList (Set.difference candidates excluded)
-+    other_home_uids = known_other_uids ++ unknown_units
-+    other_fopts_list =
-+      [ (uid, initFinderOpts (homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)))
-+      | uid <- other_home_uids
-+      ]
++        | Just real_mod_name
++              <- flip M.lookup (finder_reexportedModules opts) mod_name
++            = findImportedModuleNoHsc fc opts ue home_module_name_providers_map
++                  (Just $ DefiniteHomeUnit uid Nothing)
++                  real_mod_name
++                  NoPkgQual
++        | Set.member mod_name (finder_hiddenModules opts)
++            = return (mkHomeHidden uid)
++        | otherwise
++            = findHomePackageModule fc opts uid mod_name
++
++    any_home_import :: IO FindResult
++    any_home_import = foldr1 orIfNotFound $
++                      home_import :| map home_pkg_import other_fopts
++    {-
++        Do not try to be smart and change this to `foldr orIfNotFound
++        home_import (map home_pkg_import other_fopts)`, as that would not be the
++        same. `home_import` is first because we need to first look within the
++        current unit before looking at the other units in order.
++    -}
++
++    pkg_import :: IO FindResult
++    pkg_import = findExposedPackageModule fc fopts unit_state mod_name mb_pkg
++
++    unqual_import :: IO FindResult
++    unqual_import
++        = any_home_import
++          `orIfNotFound`
++          findExposedPackageModule fc fopts unit_state mod_name NoPkgQual
++
++    unit_state :: UnitState
++    unit_state = case mb_home_unit_id of
++        Nothing           -> ue_homeUnitState ue
++        Just home_unit_id -> HUG.homeUnitEnv_units $
++                             ue_findHomeUnitEnv home_unit_id ue
++
++    home_unit_deps :: Set UnitId
++    home_unit_deps = Set.fromList (homeUnitDepends unit_state)
++
++    ranked_home_unit_deps :: [UnitId]
++    ranked_home_unit_deps = rankedHomeUnitDeps home_module_name_providers_map
++                                               mod_name
++                                               home_unit_deps
++
++    other_fopts :: [(UnitId, FinderOpts)]
++    other_fopts
++        = [
++              (uid, opts) |
++                  uid <- ranked_home_unit_deps,
++                  let opts = initFinderOpts $
++                             homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)
++          ]
++
++rankedHomeUnitDeps :: HomeModuleNameProvidersMap
++                   -> ModuleName
++                   -> Set UnitId
++                   -> [UnitId]
++rankedHomeUnitDeps _ _ home_unit_deps | Set.null home_unit_deps
++    = []
++rankedHomeUnitDeps home_module_name_providers_map mod_name home_unit_deps
++    = Set.toList cached_deps ++ Set.toList uncached_deps
++    where
++
++    cached_providers :: Set UnitId
++    cached_providers = lookupWithDefaultUniqMap home_module_name_providers_map
++                                                Set.empty
++                                                mod_name
++
++    cached_deps :: Set UnitId
++    cached_deps = Set.intersection home_unit_deps cached_providers
++
++    uncached_deps :: Set UnitId
++    uncached_deps = Set.difference home_unit_deps cached_providers
++{-
++    The special handling of the situation where the dependency set is empty does
++    not change the result, but it avoids triggering evaluation of the module
++    graph.
++-}
  
  -- | Locate a plugin module requested by the user, for a compiler
  -- plugin.  This consults the same set of exposed packages as
+@@ -235,15 +309,15 @@
+ findPluginModule hsc_env mod_name = do
+   let fc = hsc_FC hsc_env
+   let units = hsc_units hsc_env
+-  let mhome_unit = hsc_home_unit_maybe hsc_env
+-  findPluginModuleNoHsc fc (initFinderOpts (hsc_dflags hsc_env)) units mhome_unit mod_name
++  let mb_home_unit = hsc_home_unit_maybe hsc_env
++  findPluginModuleNoHsc fc (initFinderOpts (hsc_dflags hsc_env)) units mb_home_unit mod_name
+ 
+ 
+ -- | A version of findExactModule which takes the exact parts of the HscEnv it needs
+ -- directly.
+ findExactModuleNoHsc :: FinderCache -> FinderOpts -> UnitEnvGraph FinderOpts -> UnitState -> Maybe HomeUnit -> InstalledModule -> IsBootInterface -> IO InstalledFindResult
+-findExactModuleNoHsc fc fopts other_fopts unit_state mhome_unit mod is_boot = do
+-  res <- case mhome_unit of
++findExactModuleNoHsc fc fopts other_fopts unit_state mb_home_unit mod is_boot = do
++  res <- case mb_home_unit of
+     Just home_unit
+      | isHomeInstalledModule home_unit mod
+         -> findInstalledHomeModule fc fopts (homeUnitId home_unit) (moduleName mod)
 diff --git a/compiler/GHC/Unit/Module/Graph.hs b/compiler/GHC/Unit/Module/Graph.hs
-index e56ee33ca7..c6e9ffa69b 100644
+index e56ee33ca7..185164d802 100644
 --- a/compiler/GHC/Unit/Module/Graph.hs
 +++ b/compiler/GHC/Unit/Module/Graph.hs
 @@ -69,6 +69,8 @@
     , mgLookupModule
     , mgLookupModuleName
     , mgHasHoles
-+   , ModuleNameHomeMap (ModuleNameHomeMap)
-+   , mgHomeModuleMap
++   , HomeModuleNameProvidersMap
++   , mgHomeModuleNameProvidersMap
     , showModMsg
  
      -- ** Reachability queries
-@@ -158,10 +160,11 @@
+@@ -158,10 +160,12 @@
  import GHC.Utils.Misc ( partitionWith )
  
  import System.FilePath
@@ -127,46 +245,32 @@ index e56ee33ca7..c6e9ffa69b 100644
  import GHC.Types.Unique.DSet
 -import qualified Data.Set as Set
 -import Data.Set (Set)
++import GHC.Types.Unique.Map (UniqMap, emptyUniqMap, listToUniqMap_C)
  import GHC.Unit.Module
  import GHC.Unit.Module.ModNodeKey
  import GHC.Unit.Module.Stage
-@@ -206,14 +209,47 @@
+@@ -206,14 +210,32 @@
    -- Cached computation, whether any of the ModuleGraphNode are isHoleModule,
    -- This is only used for a hack in GHC.Iface.Load to do with backpack, please
    -- remove this at the earliest opportunity.
-+  , mg_home_map :: ModuleNameHomeMap
-+    -- ^ For each module name, which home unit UnitIds define it together with the set of units for which the listing is complete.
++  , mg_home_module_name_providers_map :: HomeModuleNameProvidersMap
++    -- ^ For each module name, which home units provide it.
    }
  
-+data ModuleNameHomeMap = ModuleNameHomeMap !(Set UnitId)
-+                                           !(Map ModuleName (Set UnitId))
++type HomeModuleNameProvidersMap = UniqMap ModuleName (Set UnitId)
 +
-+mkHomeModuleMap :: [ModuleGraphNode] -> ModuleNameHomeMap
-+mkHomeModuleMap nodes = ModuleNameHomeMap completeUnits providerMap where
++mkHomeModuleNameProvidersMap :: [ModuleGraphNode] -> HomeModuleNameProvidersMap
++mkHomeModuleNameProvidersMap nodes
++    = listToUniqMap_C Set.union $
++      [
++          (moduleName, Set.singleton unitID) |
++              ModuleNode _ moduleNodeInfo <- nodes,
++              let moduleName = moduleNodeInfoModuleName moduleNodeInfo,
++              let unitID     = moduleNodeInfoUnitId moduleNodeInfo
++      ]
 +
-+    providerMap :: Map ModuleName (Set UnitId)
-+    providerMap
-+        = Map.fromListWith Set.union $
-+          [
-+              (ms_mod_name modSummary, Set.singleton (ms_unitid modSummary)) |
-+                  ModuleNode _ (ModuleNodeCompile modSummary) <- nodes
-+          ]
-+
-+    completeUnits :: Set UnitId
-+    completeUnits
-+        = Set.fromList $
-+          [
-+              ms_unitid modSummary |
-+                  ModuleNode _ (ModuleNodeCompile modSummary) <- nodes
-+          ]
-+
-+    {-NOTE:
-+        The matching with `ModuleNodeCompile` results in nodes with
-+        `ModuleNodeFixed` in their info being dropped.
-+    -}
-+
-+mgHomeModuleMap :: ModuleGraph -> ModuleNameHomeMap
-+mgHomeModuleMap = mg_home_map
++mgHomeModuleNameProvidersMap :: ModuleGraph -> HomeModuleNameProvidersMap
++mgHomeModuleNameProvidersMap = mg_home_module_name_providers_map
 +
  -- | Why do we ever need to construct empty graphs? Is it because of one shot mode?
  emptyMG :: ModuleGraph
@@ -174,11 +278,11 @@ index e56ee33ca7..c6e9ffa69b 100644
                           (graphReachability emptyGraph, const Nothing)
                           (graphReachability emptyGraph, const Nothing)
                           False
-+                         (ModuleNameHomeMap Set.empty Map.empty)
++                         emptyUniqMap
  
  -- | Construct a module graph. This function should be the only entry point for
  -- building a 'ModuleGraph', since it is supposed to be built once and never modified.
-@@ -312,7 +348,7 @@
+@@ -312,7 +334,7 @@
    where
      duplicate_errs = rights (Map.elems node_types)
  
@@ -187,7 +291,7 @@ index e56ee33ca7..c6e9ffa69b 100644
      node_types = Map.fromListWithKey go [ (mkNodeKey n, Left (moduleNodeType n)) | n <- mg_mss ]
        where
          -- Multiple nodes with the same key are not allowed.
-@@ -323,7 +359,7 @@
+@@ -323,7 +345,7 @@
  
  -- | Check that all dependencies in the graph are present in the node_types map.
  -- This is a helper function used by checkModuleGraph.
@@ -196,7 +300,7 @@ index e56ee33ca7..c6e9ffa69b 100644
                              -> ModuleGraphNode
                              -> Maybe ModuleGraphInvariantError
  checkAllDependenciesInGraph node_types node =
-@@ -338,7 +374,7 @@
+@@ -338,7 +360,7 @@
  -- | Check if for the fixed module node invariant:
  --
  --   Fixed nodes can only depend on other fixed nodes.
@@ -205,7 +309,7 @@ index e56ee33ca7..c6e9ffa69b 100644
                  -> ModuleGraphNode
                  -> Maybe ModuleGraphInvariantError
  checkFixedModuleInvariant node_types node = case node of
-@@ -488,13 +524,17 @@
+@@ -488,13 +510,17 @@
  -- To preserve invariants, 'f' can't change the isBoot status.
  mapMG :: (ModSummary -> ModSummary) -> ModuleGraph -> ModuleGraph
  mapMG f mg@ModuleGraph{..} = mg
@@ -216,7 +320,7 @@ index e56ee33ca7..c6e9ffa69b 100644
 -      ModuleNode deps (ModuleNodeCompile ms) -> ModuleNode deps (ModuleNodeCompile (f ms))
 -      UnitNode deps uid -> UnitNode deps uid
 +  { mg_mss = new_mss
-+  , mg_home_map = mkHomeModuleMap new_mss
++  , mg_home_module_name_providers_map = mkHomeModuleNameProvidersMap new_mss
    }
 +  where
 +    new_mss =
@@ -229,7 +333,7 @@ index e56ee33ca7..c6e9ffa69b 100644
  
  -- | Map a function 'f' over all the 'ModSummaries', in 'IO'.
  -- To preserve invariants, 'f' can't change the isBoot status.
-@@ -847,7 +887,7 @@
+@@ -847,7 +873,7 @@
  -- described in the export list haddocks.
  --------------------------------------------------------------------------------
  
@@ -238,7 +342,7 @@ index e56ee33ca7..c6e9ffa69b 100644
    deriving (Functor, Traversable, Foldable)
  
  -- | Transitive dependencies, including SOURCE edges
-@@ -923,7 +963,7 @@
+@@ -923,7 +949,7 @@
      lookup_key :: ZeroScopeKey -> Maybe Int
      lookup_key = fmap zeroSummaryNodeKey . lookup_node
  
@@ -247,7 +351,7 @@ index e56ee33ca7..c6e9ffa69b 100644
      node_map =
        Map.fromList [ (s, node)
                     | node <- nodes
-@@ -1022,7 +1062,7 @@
+@@ -1022,7 +1048,7 @@
      lookup_key ::  (NodeKey, ModuleStage) -> Maybe Int
      lookup_key = fmap stageSummaryNodeKey . lookup_node
  
@@ -256,7 +360,7 @@ index e56ee33ca7..c6e9ffa69b 100644
      node_map =
        Map.fromList [ (s, node)
                     | node <- nodes
-@@ -1040,10 +1080,13 @@
+@@ -1040,10 +1066,13 @@
  extendMG :: ModuleGraph -> ModuleGraphNode -> ModuleGraph
  extendMG ModuleGraph{..} node =
    ModuleGraph
@@ -269,13 +373,13 @@ index e56ee33ca7..c6e9ffa69b 100644
 +    , mg_loop_graph = mkTransLoopDeps new_mss
 +    , mg_zero_graph = mkTransZeroDeps new_mss
      , mg_has_holes = mg_has_holes || maybe False isHsigFile (moduleNodeInfoHscSource =<< mgNodeIsModule node)
-+    , mg_home_map = mkHomeModuleMap new_mss
++    , mg_home_module_name_providers_map = mkHomeModuleNameProvidersMap new_mss
      }
 +  where
 +    new_mss = node : mg_mss
  
 diff --git a/ghc/GHCi/UI.hs b/ghc/GHCi/UI.hs
-index 0243b5767d..eb0e208172 100644
+index 0243b5767d..204a0e5169 100644
 --- a/ghc/GHCi/UI.hs
 +++ b/ghc/GHCi/UI.hs
 @@ -478,9 +478,9 @@
@@ -367,6 +471,17 @@ index 0243b5767d..eb0e208172 100644
          }
  
    let
+@@ -2282,9 +2283,8 @@
+     checkTargetModule :: GhciMonad m => ModuleName -> m Bool
+     checkTargetModule m = do
+       hsc_env <- GHC.getSession
+-      let home_unit = hsc_home_unit hsc_env
+       result <- liftIO $
+-        Finder.findImportedModule hsc_env m (ThisPkg (homeUnitId home_unit))
++        Finder.findImportedModule hsc_env m NoPkgQual
+       case result of
+         Found _ _ -> return True
+         _ -> do reportError (GhciModuleError $ GhciModuleNotFound (moduleNameString m))
 diff --git a/ghc/Main.hs b/ghc/Main.hs
 index 259678550f..3558741350 100644
 --- a/ghc/Main.hs
